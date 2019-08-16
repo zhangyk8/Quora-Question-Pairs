@@ -1,0 +1,630 @@
+---
+title: "Quora Question Pairs"
+author: "Yikun Zhang"
+output: pdf_document
+---
+
+# Libraries used
+```{r}
+library(data.table)
+library(dplyr)
+library(tm)
+library(stringr)
+library(stringdist)
+library(tidytext)
+library(syuzhet)
+library(text2vec)
+library(widyr)
+library(igraph)
+library(ggraph)
+```
+
+
+# Reading the data
+```{r}
+train = fread("input/train.csv", encoding = "UTF-8") %>% as.data.frame(stringAsFactors = F)
+# test = fread("input/test.csv", encoding = "UTF-8") %>% as.data.frame(stringAsFactors = F)
+```
+
+
+# Data Cleaning
+```{r}
+clearCon = function(content){
+  content = gsub("[\n\r]", " ", content)
+  content = gsub("(?<=[\\s])\\s*|^\\s+|\\s+$", "", content, perl = TRUE)
+  content = gsub("<img src.*?>", "", content)
+  # text between [] refers to tags e.g. [math]
+  content = gsub("\\[math\\]", "", content)
+  content = removePunctuation(content, preserve_intra_word_dashes = TRUE)
+  content = tolower(content)
+  return(content)
+}
+
+train$question1 = sapply(train$question1, clearCon)
+train$question2 = sapply(train$question2, clearCon)
+
+# test$question1 = sapply(test$question1, clearCon)
+# test$question2 = sapply(test$question2, clearCon)
+
+criTrain = (nchar(train$question1) == 0 | nchar(train$question2) == 0)
+sum(criTrain)
+# criTest = (nchar(test$question1) == 0 | nchar(test$question2) == 0)
+# sum(criTest)
+
+train = train[!criTrain, ]
+
+# Randomly sample rows from train to construct the training set and test set
+set.seed(1029)
+trainIn = sample(1:nrow(train), size = 10000, replace = FALSE)
+testIn = sample((1:nrow(train))[-trainIn], size = 60000, replace = FALSE)
+
+trainset = train[trainIn,]
+testset = train[testIn,]
+```
+
+
+# Exploratory Data Analysis
+
+## Helper function: Concatenate multiple plots into a single plot
+```{r}
+multiplot = function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots = c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx = as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+
+
+```{r}
+library(ggplot2)
+# distribution of common words' count in "0" and "1", respectively
+words_in_common = function(string, count = T) {
+  vec = strsplit(string, split = " ")
+  
+  q1_words = unique(vec[[1]])
+  q2_words = unique(vec[[2]])
+  qboth_words = intersect(q1_words, q2_words)
+  qtotal_words = unique(c(q1_words, q2_words))
+  
+  if(length(qtotal_words) > 0){
+    if(count){
+      result = length(qboth_words)
+    }else{
+      result = length(qboth_words) / length(qtotal_words)
+    }
+  } else {
+    result = 0
+  }
+  return(result)
+}
+
+trainset$com_word = apply(cbind(trainset$question1, trainset$question2), MARGIN = 1, words_in_common, count = T)
+
+# Histogram of common words count
+ggplot(trainset) + 
+  geom_histogram(mapping = aes(x = com_word, fill = is_duplicate), 
+                 position = "dodge", 
+                 alpha = 0.9, 
+                 bins = 24) + 
+  labs(x = "The Number of Common Words in Q1 & Q2", 
+       y = "Count", 
+       title = "Histogram: The Number of Words that Occurs BOTH in Q1 and Q2") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+# tf_idf for q1 and q2
+q1tfidf = trainset %>%
+  unnest_tokens(word, question1) %>%
+  filter(!(word %in% stop_words$word)) %>%
+  count(id, word, sort = TRUE) %>%
+  filter(str_detect(word, "[a-z]")) %>%
+  ungroup() %>%
+  left_join(trainset, by = "id") %>%
+  select(id, word, n, is_duplicate) %>%
+  bind_tf_idf(word, id, n) %>%
+  arrange(desc(tf_idf)) %>%
+  mutate(word = factor(word, levels = rev(unique(word))))
+
+q1tfidfplot = q1tfidf[1:10,] %>% 
+  ggplot(aes(word, tf_idf, fill = is_duplicate)) +
+  geom_col() +
+  labs(x = NULL, y = "tf-idf (Q1)") +
+  coord_flip()
+q1tfidfplot
+
+q2tfidf = trainset %>%
+  unnest_tokens(word, question2) %>%
+  filter(!(word %in% stop_words$word)) %>%
+  count(id, word, sort = TRUE) %>%
+  filter(str_detect(word, "[a-z]")) %>%
+  ungroup() %>%
+  left_join(trainset, by = "id") %>%
+  select(id, word, n, is_duplicate) %>%
+  bind_tf_idf(word, id, n) %>%
+  arrange(desc(tf_idf)) %>%
+  mutate(word = factor(word, levels = rev(unique(word))))
+
+q2tfidfplot = q2tfidf[1:10,] %>% 
+  ggplot(aes(word, tf_idf, fill = is_duplicate)) +
+  geom_col() +
+  labs(x = NULL, y = "tf-idf (Q2)") +
+  coord_flip()
+q2tfidfplot
+multiplot(q1tfidfplot, q2tfidfplot)
+
+pair_words = trainset %>%
+  mutate(whole_con = paste(question1, question2, sep = " ")) %>%
+  unnest_tokens(word, whole_con) %>%
+  filter(!word %in% stop_words$word, str_detect(word, "[a-z]")) %>%
+  select(id, word, is_duplicate)
+
+
+set.seed(1234)
+pairplot1 = pair_words %>%
+  filter(is_duplicate == "1") %>%
+  pairwise_count(word, id, sort = TRUE, upper = FALSE) %>%
+  filter(n >= 5) %>%
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n, edge_width = n), edge_colour = "cyan4") +
+  geom_node_point(size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE, 
+                 point.padding = unit(0.2, "lines")) +
+  theme_void()
+pairplot1
+
+pairplot0 = pair_words %>%
+  filter(is_duplicate == "0") %>%
+  pairwise_count(word, id, sort = TRUE, upper = FALSE) %>%
+  filter(n >= 5) %>%
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n, edge_width = n), edge_colour = "darkred") +
+  geom_node_point(size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE, 
+                 point.padding = unit(0.2, "lines")) +
+  theme_void()
+pairplot0
+
+```
+
+
+## Feature Creating
+```{r}
+# functional programming
+featureE = function(data){
+  # common word counts
+  words_in_common = function(string, count = T) {
+  vec = strsplit(string, split = " ")
+  
+  q1_words = unique(vec[[1]])
+  q2_words = unique(vec[[2]])
+  qboth_words = intersect(q1_words, q2_words)
+  qtotal_words = unique(c(q1_words, q2_words))
+  
+  ## Remove stop words
+  qboth_words = qboth_words[!qboth_words %in% stop_words$word]
+  qtotal_words = qtotal_words[!qtotal_words %in% stop_words$word]
+  
+  if(length(qtotal_words) > 0){
+    if(count){
+      result = length(qboth_words)
+    }else{
+      result = length(qboth_words) / length(qtotal_words)
+    }
+  } else {
+    result = 0
+  }
+  return(result)
+}
+
+data$com_word = apply(cbind(data$question1, data$question2), MARGIN = 1, words_in_common, count = T)
+data$com_word_ratio = apply(cbind(data$question1, data$question2), MARGIN = 1, words_in_common, count = F)
+
+# Character count
+q1_char_count = as.numeric(nchar(data$question1))
+q2_char_count = as.numeric(nchar(data$question2))
+total_characters = apply(cbind(q1_char_count, q2_char_count), MARGIN = 1, max)
+data$char_count_ratio = 1 - abs(q1_char_count - q2_char_count) / total_characters
+
+# string distance
+data$qu_dist = 1 - stringdist(data$question1, data$question2, method = "lv") / total_characters
+
+# Word count
+q1_word_count = as.numeric(str_count(data$question1, "\\S+"))
+q2_word_count = as.numeric(str_count(data$question2, "\\S+"))
+total_words = apply(cbind(q1_word_count, q2_word_count), MARGIN = 1, max)
+data$word_count_ratio = 1 - abs(q1_word_count - q2_word_count) / total_words
+
+# top3 tf_idf
+q1Ttfidf1 = data %>%
+  unnest_tokens(word, question1) %>%
+  filter(!(word %in% stop_words$word)) %>%
+  count(id, word, sort = TRUE) %>%
+  filter(str_detect(word, "[a-z]")) %>%
+  ungroup() %>%
+  bind_tf_idf(word, id, n)
+q1Ttfidf2 = q1Ttfidf1 %>%
+  group_by(id) %>%
+  arrange(desc(tf_idf)) %>%
+  top_n(3, tf_idf) %>%
+  summarise(total.tfidf1 = sum(tf_idf))
+  
+q2Ttfidf1 = data %>%
+    unnest_tokens(word, question2) %>%
+    filter(!(word %in% stop_words$word)) %>%
+    count(id, word, sort = TRUE) %>%
+    filter(str_detect(word, "[a-z]")) %>%
+    ungroup() %>%
+    bind_tf_idf(word, id, n) 
+q2Ttfidf2 = q2Ttfidf1 %>%
+    group_by(id) %>%
+    arrange(desc(tf_idf)) %>%
+    top_n(3, tf_idf) %>%
+    summarise(total.tfidf2 = sum(tf_idf))
+
+tf_idf1 = q1Ttfidf2 %>%
+  inner_join(q2Ttfidf2, by = "id")
+
+tf_idf1$tfidfdiff = 1 - (abs(tf_idf1$total.tfidf1 - tf_idf1$total.tfidf2) / apply(cbind(tf_idf1$total.tfidf2, tf_idf1$total.tfidf1), MARGIN = 1, max, na.rm = T))
+
+tf_idf1 = tf_idf1[c("id", "tfidfdiff")]
+data = data %>%
+  left_join(tf_idf1, by = "id")
+
+# common words' tf_idf
+data[c("q1_com_tfidf", "q2_com_tfidf")] = apply(cbind(data$id, data$question1, data$question2), MARGIN = 1, function(item){
+  vec = strsplit(item[2:3], split = " ")
+  
+  q1_words = unique(vec[[1]])
+  q2_words = unique(vec[[2]])
+  qboth_words = intersect(q1_words, q2_words)
+  
+  if(length(qboth_words) == 0) return(c(0,0))
+  tfidf1 = sapply(qboth_words, function(w){
+    ti = q1Ttfidf1 %>%
+    filter(word == w, id == item[1])
+    return(as.numeric(ti$tf_idf))
+  })
+  tfidf2 = sapply(qboth_words, function(w){
+    ti = q2Ttfidf1 %>%
+    filter(word == w, id == item[1])
+    return(as.numeric(ti$tf_idf))
+  })
+  return(c(sum(unlist(tfidf1)), sum(unlist(tfidf2))))
+})
+
+# word emotions
+sentiment1 = get_nrc_sentiment(data$question1)
+sentiment2 = get_nrc_sentiment(data$question2)
+
+data$pos_diff = abs(sentiment1$positive - sentiment2$positive)
+
+# Jaccard similarities between q1 and q2
+q1_train = data$question1 %>%
+  str_replace_all("[^[a-z]]", " ") %>%
+  word_tokenizer() %>%
+  itoken(progressbar = FALSE)
+q1_words = create_vocabulary(q1_train)
+vectorizer = vocab_vectorizer(q1_words)
+q1_dtm = create_dtm(q1_train, vectorizer = vectorizer)
+
+q2_train = data$question2 %>%
+  str_replace_all("[^[a-z]]", " ") %>%
+  word_tokenizer() %>%
+  itoken(progressbar = FALSE)
+q2_dtm = create_dtm(q2_train, vectorizer = vectorizer)
+
+## the results of jaccard and cosine are similar
+data$q1_q2_sim = psim2(q1_dtm, q2_dtm, method = "jaccard", norm = "none")
+
+# average pair words count of common words
+words_count = data %>%
+    mutate(whole_con = paste(question1, question2, sep = " ")) %>%
+    unnest_tokens(word, whole_con) %>%
+    filter(!word %in% stop_words$word, str_detect(word, "[a-z]")) %>%
+    select(id, word) %>%
+    pairwise_count(word, id, sort = TRUE, upper = FALSE)
+
+data$com_pair_count = apply(cbind(data$id, data$question1, data$question2), MARGIN = 1, function(item){
+  vec = strsplit(item[2:3], split = " ")
+  
+  q1_words = unique(vec[[1]])
+  q2_words = unique(vec[[2]])
+  qboth_words = intersect(q1_words, q2_words)
+  
+  qboth_words = qboth_words[!qboth_words %in% stop_words$word]
+  
+  if(length(qboth_words) == 0) return(0)
+  word_c = matrix(0, ncol = length(qboth_words), nrow = length(qboth_words))
+  for(i in 1:length(qboth_words)){
+    for(j in 1:length(qboth_words)){
+      c = words_count %>%
+        filter(item1 == qboth_words[i], item2 == qboth_words[j])
+      if(length(c$n) == 0){
+        word_c[i,j] = 0
+      }else{
+        word_c[i,j] = c$n
+      }
+    }
+  }
+  N = (length(qboth_words)^2 - length(qboth_words))/2
+  
+  return(sum(word_c)/N)
+})
+
+return(data)
+}
+
+trainset = featureE(trainset)
+testset = featureE(testset)
+
+trainset$is_duplicate = as.factor(trainset$is_duplicate)
+testset$is_duplicate = as.factor(testset$is_duplicate)
+
+trainset$tfidfdiff[is.na(trainset$tfidfdiff)] = 0
+testset$tfidfdiff[is.na(testset$tfidfdiff)] = 0
+
+trainset$com_pair_count[is.nan(trainset$com_pair_count)] = 0
+testset$com_pair_count[is.nan(testset$com_pair_count)] = 0
+```
+
+
+# Model building
+## Random Forest
+```{r}
+library(randomForest)
+tr = trainset[,-(2:5)]
+
+set.seed(1257)
+rf.fit = randomForest(is_duplicate ~ ., data = tr[,-1], type = "class", ntree = 500)
+rf.pred = predict(rf.fit, testset[,-(1:6)], type = "prob")
+importance(rf.fit)
+
+Impor1 = data_frame(var_name = row.names(importance(rf.fit)), impor = importance(rf.fit)[,1])
+Impor1 %>%
+  arrange(desc(impor)) %>%
+  mutate(var_name = factor(var_name, levels = rev(var_name))) %>%
+  ggplot(aes(var_name, impor, fill = var_name)) +
+  geom_col() +
+  coord_flip() + 
+  labs(x = "Variables", y = "Importance (Mean Decrease Gini)") +
+  guides(fill=FALSE)
+
+# bound the results, otherwise you might get infinity results
+pred = apply(rf.pred, c(1,2), function(x) min(max(x, 1E-15), 1-1E-15)) 
+
+logLoss = function(pred, actual){
+  -1 * mean(log(pred[model.matrix(~ actual + 0) - pred > 0]))
+}
+
+# sum(testset$is_duplicate != rf.pred)
+
+rf.ll = logLoss(pred, testset$is_duplicate)
+rf.ll
+```
+
+
+## XGBoost
+```{r}
+library(xgboost)
+library(plot3D)
+
+eta = seq(0.01, 0.3, by = 0.01)
+nrounds = seq(10, 200, by = 20)
+
+Logloss = matrix(0, nrow = length(eta), ncol = length(nrounds))
+
+set.seed(1234)
+system.time(
+for(i in 1:length(eta)){
+  for(j in 1:length(nrounds)){
+    param = list(objective = "binary:logistic", 
+              eval_metric = "logloss",
+              booster = "gbtree", 
+              gamma = 1, 
+              eta = eta[i],
+              subsample = 0.7,
+              colsample_bytree = 1,
+              min_child_weight = 0.5,
+              max_depth = 4)
+    
+    # 5-fold cross-validation
+    permuteIndices = sample(nrow(trainset))
+    folds = matrix(permuteIndices, ncol = 5)
+    
+    xgb.pred = apply(folds, MARGIN = 2, function(index){
+      
+      trainfold = trainset[-as.integer(index), ]
+      Y = as.character(trainfold$is_duplicate)
+      testfold = trainset[as.integer(index), ]
+      
+      xgb.fit = xgboost(params = param, data.matrix(trainfold[,-(1:6)]), label = Y, print_every_n = 100, nrounds = nrounds[j])
+      pred = predict(xgb.fit, data.matrix(testfold[,-(1:6)]))
+      pred = matrix(cbind(1-pred, pred), ncol = 2)
+      pred = apply(pred, c(1,2), function(x) min(max(x, 1E-15), 1-1E-15))
+      
+      return(logLoss(pred, testfold$is_duplicate))
+    })
+    
+    Logloss[i,j] = mean(xgb.pred)
+  }
+}
+)
+# elapsed time: 678.19s 1150.93s
+
+M = mesh(eta, nrounds)
+scatter3D(x = M$x, y = M$y, z = Logloss, pch = 16, cex = 1, ticktype = "detailed", theta = 25, phi = 5, xlab = "eta", ylab = "nrounds", zlab = "Logloss", clab = "Logloss", main = "The Logloss of Grid-searching parameters\n (eta, nrounds) (5-fold CV)")
+
+nrounds.min = M$y[which.min(Logloss)]
+eta.min = M$x[which.min(Logloss)]
+
+param = list(objective = "binary:logistic", 
+             eval_metric = "logloss",
+             booster = "gbtree", 
+             eta = eta.min,
+             gamma = 1,
+             subsample = 0.7,
+             colsample_bytree = 1,
+             min_child_weight = 0.5,
+             max_depth = 4)
+
+Y = as.character(trainset$is_duplicate)
+xgb.fit = xgboost(params = param, data.matrix(trainset[,-(1:6)]), label = Y, print_every_n = 100, nrounds = nrounds.min)
+
+xgb.pred = predict(xgb.fit, data.matrix(testset[,-(1:6)]))
+# xgb.pred = as.factor(ifelse(xgb.pred > 0.1, 1, 0))
+# sum(xgb.pred != testset$is_duplicate)
+xgb.pred = matrix(cbind(1-xgb.pred, xgb.pred), ncol = 2)
+
+pred = apply(xgb.pred, c(1,2), function(x) min(max(x, 1E-15), 1-1E-15))
+
+xgb.ll = logLoss(pred, testset$is_duplicate)
+xgb.ll
+```
+
+
+## Lasso Regression
+```{r}
+library(glmnet)
+lasso.fit = cv.glmnet(x = as.matrix(trainset[,-(1:6)]), y = trainset$is_duplicate, family = "binomial", nfolds = 5, alpha = 1, type.measure = "class")
+plot.cv.glmnet(lasso.fit)
+
+lasso.pred = predict(lasso.fit, data.matrix(testset[,-(1:6)]), type = "response")
+# sum(testset$is_duplicate != lasso.pred)
+
+pred = matrix(cbind(1-lasso.pred, lasso.pred), ncol = 2)
+pred = apply(pred, c(1,2), function(x) min(max(x, 1E-15), 1-1E-15))
+lasso.ll = logLoss(pred, testset$is_duplicate)
+lasso.ll
+```
+
+
+# Model Stacking
+```{r}
+# drop those variables with low importances before stacking
+lowimp = Impor1 %>% 
+  arrange(desc(impor)) %>%
+  mutate(var_name = factor(var_name, levels = rev(var_name))) %>%
+  top_n(-6, impor)
+
+trainset1 = trainset[, !(colnames(trainset) %in% as.character(lowimp$var_name))]
+testset1 = testset[, !(colnames(testset) %in% as.character(lowimp$var_name))]
+
+lasso.fit1 = cv.glmnet(x = as.matrix(trainset1[,-(1:6)]), y = trainset1$is_duplicate, family = "binomial", nfolds = 5, alpha = 1, type.measure = "class")
+
+trainset1$lasso.pred = predict(lasso.fit1, data.matrix(trainset1[,-(1:6)]), type = "response")
+testset1$lasso.pred = predict(lasso.fit1, data.matrix(testset1[,-(1:6)]), type = "response")
+
+param = list(objective = "binary:logistic", 
+             eval_metric = "logloss",
+             booster = "gbtree", 
+             eta = eta.min,
+             gamma = 1,
+             subsample = 0.7,
+             colsample_bytree = 1,
+             min_child_weight = 0.5,
+             max_depth = 4)
+
+Y = as.character(trainset1$is_duplicate)
+xgb.fit1 = xgboost(params = param, data.matrix(trainset1[,-(1:6)]), label = Y, print_every_n = 100, nrounds = nrounds.min)
+
+trainset1$xgb.pred = predict(xgb.fit1, data.matrix(trainset1[,-(1:6)]))
+
+testset1$xgb.pred = predict(xgb.fit1, data.matrix(testset1[,-(1:6)]))
+
+
+tr1 = trainset1[,-(2:5)]
+stack.rf = randomForest(is_duplicate ~ ., data = tr1[,-1], type = "class", ntree = 500)
+
+stack.rf.pred = predict(stack.rf, testset1[,-(1:6)], type = "prob")
+importance(stack.rf)
+
+Impor2 = data_frame(var_name = row.names(importance(stack.rf)), impor = importance(stack.rf)[,1])
+Impor2 %>%
+  arrange(desc(impor)) %>%
+  mutate(var_name = factor(var_name, levels = rev(var_name))) %>%
+  ggplot(aes(var_name, impor, fill = var_name)) +
+  geom_col() +
+  coord_flip() + 
+  labs(x = "Variables", y = "Importance") +
+  guides(fill=FALSE)
+
+pred = apply(stack.rf.pred, c(1,2), function(x) min(max(x, 1E-15), 1-1E-15)) 
+
+# sum(testset$is_duplicate != rf.pred)
+
+logLoss(pred, testset1$is_duplicate)
+library(pROC)
+auc = roc(testset1$is_duplicate, stack.rf.pred[,2])
+print(auc)
+plot(auc, ylim = c(0,1), print.thres = TRUE, main = paste('AUC', round(auc$auc[[1]],2)))
+abline(h=1,col="blue",lwd=2)
+abline(h=0,col="red",lwd=2)
+```
+
+
+# SMOTE
+```{r}
+library(DMwR)
+
+prop.table(table(trainset1$is_duplicate))
+prop.table(table(testset1$is_duplicate))
+
+trainset2 = SMOTE(is_duplicate ~., trainset1[,-(1:5)], perc.over = 100, k = 5, perc.under = 200)
+prop.table(table(trainset2$is_duplicate))
+
+SMOTE.rf = randomForest(is_duplicate ~., data = trainset2, type = "class", ntree = 500)
+SMOTE.rf.pred = predict(SMOTE.rf, testset1[,-(1:6)], type = "prob")
+
+pred = apply(SMOTE.rf.pred, c(1,2), function(x) min(max(x, 1E-15), 1-1E-15)) 
+
+# sum(testset$is_duplicate != rf.pred)
+
+logLoss(pred, testset1$is_duplicate)
+
+```
+
+# Ensemble Learning
+```{r}
+wt.lasso = 1 - lasso.ll
+wt.xgb = 1 - xgb.ll
+wt.rf = 1 - rf.ll
+whole.wt = wt.rf + wt.lasso + wt.xgb
+
+el.pred = (wt.lasso/whole.wt) * lasso.pred[,1] + (wt.rf/whole.wt) * rf.pred[,2] + (wt.xgb/whole.wt) * xgb.pred[,2]
+
+pred = apply(cbind(1-el.pred, el.pred), c(1,2), function(x) min(max(x, 1E-15), 1-1E-15))
+logLoss(pred, testset$is_duplicate)
+```
+
